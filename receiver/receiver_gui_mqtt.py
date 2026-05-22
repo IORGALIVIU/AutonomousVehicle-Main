@@ -15,6 +15,7 @@ import time
 import queue
 import threading
 import json
+import socket
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -275,7 +276,9 @@ class VideoReceiverGUI_MQTT:
             "fps": 0,
             "resolution": "N/A",
             "connection_state": "Disconnected",
-            "mqtt_state": "Disconnected"
+            "mqtt_state": "Disconnected",
+            "video_delay_ms": 0,
+            "mqtt_delay_ms": 0
         }
 
         # MQTT Handler
@@ -286,15 +289,15 @@ class VideoReceiverGUI_MQTT:
         # Gamepad Controller for keyboard input
         from gamepad_controller import GamepadController
         self.gamepad = GamepadController(
-            angle_max=60, angle_min=-60,
+            angle_max=50, angle_min=-50,
             speed_max=100, speed_min=-100,  # Allow reverse!
-            accel_rate=90.0,  # 50 units/second
+            accel_rate=50.0,  # 50 units/second
             decel_rate=90.0,  # 80 units/second (faster return)
             quick_tap_boost=10.0  # +10 for quick taps
         )
 
         # Control values
-        self.control_mode = tk.IntVar(value=0)  # 0=auto, 1=manual
+        self.control_mode = tk.IntVar(value=1)  # 0=auto, 1=manual (Default to manual)
         self.control_angle = tk.DoubleVar(value=0.0)
         self.control_speed = tk.DoubleVar(value=0.0)
 
@@ -407,14 +410,14 @@ class VideoReceiverGUI_MQTT:
         self.keyboard_label = ttk.Label(control_panel, text="Use Arrow Keys to Control",
                                         foreground="blue", font=("Arial", 9, "bold"))
         self.keyboard_label.grid(row=1, column=0, columnspan=3, pady=(10, 5))
-        self.keyboard_label.grid_remove()  # Hidden by default
+        # visible by default since we start in manual mode
 
         # Arrow keys help
         self.arrows_help = ttk.Label(control_panel,
                                      text="↑↓ Speed  |  ←→ Angle",
                                      foreground="gray", font=("Arial", 8))
         self.arrows_help.grid(row=2, column=0, columnspan=3, pady=(0, 10))
-        self.arrows_help.grid_remove()  # Hidden by default
+        # visible by default since we start in manual mode
 
         # Angle display (read-only, no slider)
         ttk.Label(control_panel, text="Manual Angle:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
@@ -447,6 +450,8 @@ class VideoReceiverGUI_MQTT:
             ("Frames Received", "frames_received"),
             ("Current FPS", "fps"),
             ("Resolution", "resolution"),
+            ("Video Delay (ms)", "video_delay_ms"),
+            ("MQTT Delay (ms)", "mqtt_delay_ms"),
         ]
 
         for i, (label_text, key) in enumerate(stats_items):
@@ -586,6 +591,8 @@ class VideoReceiverGUI_MQTT:
         data_timestamp = sensor_data.get('timestamp', current_time_ms)
         data_age_ms = current_time_ms - data_timestamp
 
+        self.stats["mqtt_delay_ms"] = data_age_ms
+
         if data_age_ms > 500:
             self._log(f"⚠️  MQTT data is {data_age_ms}ms old (delay!)")
         elif data_age_ms > 200:
@@ -697,6 +704,8 @@ class VideoReceiverGUI_MQTT:
                 self._log("MQTT connected successfully")
                 self.root.after(0, lambda: self.mqtt_status.config(
                     text="MQTT: Connected", foreground="green"))
+                # Send the initial manual mode command to sync with robot
+                self.root.after(0, self._send_all_commands)
             else:
                 self._log("MQTT connection failed")
                 self.root.after(0, lambda: self.mqtt_connect_btn.config(state=tk.NORMAL))
@@ -819,14 +828,17 @@ class VideoReceiverGUI_MQTT:
 
                 # Store with timestamp (try to extract from frame or use current)
                 self.current_frame_timestamp = int(current_time * 1000)
+                
+                # Aproximeaza momentul trimiterii preluand cel mai recent timestamp MQTT
+                sender_timestamp = self.mqtt_handler.latest_sensor_data.get("timestamp", 0)
 
                 # Put frame in queue
                 try:
-                    self.frame_queue.put_nowait(img)
+                    self.frame_queue.put_nowait((img, sender_timestamp))
                 except queue.Full:
                     try:
                         self.frame_queue.get_nowait()
-                        self.frame_queue.put_nowait(img)
+                        self.frame_queue.put_nowait((img, sender_timestamp))
                     except:
                         pass
 
@@ -837,7 +849,25 @@ class VideoReceiverGUI_MQTT:
     def _update_video_display(self):
         """Update video display with latest sensor data."""
         try:
-            frame = self.frame_queue.get_nowait()
+            frame_data = self.frame_queue.get_nowait()
+
+            if isinstance(frame_data, tuple) and len(frame_data) == 2:
+                frame, sender_timestamp = frame_data
+            else:
+                frame = frame_data
+                sender_timestamp = 0
+
+            # Calculam Video Delay
+            current_time_ms = int(time.time() * 1000)
+            if sender_timestamp > 0:
+                video_delay_ms = current_time_ms - sender_timestamp
+                self.stats["video_delay_ms"] = video_delay_ms
+                
+                # Trimitem warning-uri
+                if video_delay_ms > 500:
+                    self._log(f"⚠️  VIDEO delay: {video_delay_ms}ms (întârziere afișare!)")
+            else:
+                self.stats["video_delay_ms"] = "N/A"
 
             # Use latest sensor data from MQTT (already updated by callback)
             # No need for complex timestamp synchronization - MQTT callback
@@ -900,16 +930,28 @@ class VideoReceiverGUI_MQTT:
             if self.loop:
                 self.loop.call_soon_threadsafe(self.loop.stop)
             self.root.destroy()
+def get_local_ip():
+    """Obtine adresa IP locala a laptopului (interfata principala)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Nu trimite date, doar afla IP-ul rutat catre internet
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def main():
+    local_ip = get_local_ip()
     parser = argparse.ArgumentParser(
         description="WebRTC + MQTT Receiver GUI (Windows)"
     )
     parser.add_argument(
         "--server-ip",
-        default="192.168.0.198",
-        help="Signaling server IP"
+        default=local_ip,
+        help=f"Signaling server IP (default: %(default)s)"
     )
     parser.add_argument(
         "--server-port",

@@ -11,8 +11,15 @@ import board
 import busio
 from adafruit_pca9685 import PCA9685
 import logging
+from config import CFG
 
 logger = logging.getLogger(__name__)
+
+_hw = CFG["hardware"]
+_TRIM_OFFSET    = _hw["trim_offset"]
+_PWM_FREQUENCY  = _hw["pwm_frequency"]
+_PWM_MIN_PCT    = _hw["pwm_min_percent"]
+_PWM_MAX_PCT    = _hw["pwm_max_percent"]
 
 
 
@@ -35,23 +42,24 @@ class RobotCarController:
     """
 
     def __init__(self,
-                 pca9685_address=0x7F,
-                 servo_channel=0,
-                 motor_a_in1=1, motor_a_in2=2, motor_a_ena=3,
-                 motor_b_in3=4, motor_b_in4=5, motor_b_enb=6):
+                 pca9685_address=None,
+                 servo_channel=None,
+                 motor_a_in1=None, motor_a_in2=None, motor_a_ena=None,
+                 motor_b_in3=None, motor_b_in4=None, motor_b_enb=None):
         """
         Initialize hardware controller.
-
-        Args:
-            pca9685_address: I2C address of PCA9685 (default 0x7F for Seed Studio)
-            servo_channel: PCA9685 channel for servo (0-15)
-            motor_a_in1: Motor A IN1 (forward direction)
-            motor_a_in2: Motor A IN2 (backward direction)
-            motor_a_ena: Motor A ENA (speed control PWM)
-            motor_b_in3: Motor B IN3 (forward direction)
-            motor_b_in4: Motor B IN4 (backward direction)
-            motor_b_enb: Motor B ENB (speed control PWM)
+        Valorile implicite sunt citite din config.yaml [hardware].
+        Pot fi suprascrise prin argumente explicite (util pentru teste).
         """
+        _hw = CFG["hardware"]
+        if pca9685_address is None: pca9685_address = _hw["i2c_address"]
+        if servo_channel   is None: servo_channel   = _hw["servo_channel"]
+        if motor_a_in1     is None: motor_a_in1     = _hw["motor_a_in1"]
+        if motor_a_in2     is None: motor_a_in2     = _hw["motor_a_in2"]
+        if motor_a_ena     is None: motor_a_ena     = _hw["motor_a_ena"]
+        if motor_b_in3     is None: motor_b_in3     = _hw["motor_b_in3"]
+        if motor_b_in4     is None: motor_b_in4     = _hw["motor_b_in4"]
+        if motor_b_enb     is None: motor_b_enb     = _hw["motor_b_enb"]
         self.enabled = False
 
         try:
@@ -60,7 +68,7 @@ class RobotCarController:
 
             # Initialize PCA9685
             self.pca = PCA9685(i2c, address=pca9685_address)
-            self.pca.frequency = 50
+            self.pca.frequency = _PWM_FREQUENCY
 
             logger.info(f"PCA9685 initialized at 0x{pca9685_address:02X}, 50Hz")
 
@@ -110,14 +118,14 @@ class RobotCarController:
             return
 
         try:
-            # Map input angle (-60 to +60) to physical servo range (-90 to +90)
-            # physical_angle = (angle / 60.0) * 90.0  #----
+            # Clamp la inputul primit de la client (-50 la +50)
+            clamped_angle = max(-50, min(50, angle))
 
-            # Clamp to physical limits
-            physical_angle = max(-60, min(60, angle))
+            # Adăugăm offset-ul constructiv din config.yaml [hardware.trim_offset]
+            physical_angle = clamped_angle + _TRIM_OFFSET
 
             # Convert angle to pulse width (ms)
-            pulse_ms = 1.5 + (physical_angle / 90.0) * 1.0  # ----
+            pulse_ms = 1.5 + (physical_angle / 90.0) * 1.0
 
             # Convert pulse width to PWM duty cycle (0-65535)
             # At 50Hz: period = 20ms, PCA9685 uses 16-bit resolution
@@ -166,7 +174,14 @@ class RobotCarController:
     def _set_motor_forward(self, speed_percent: float):
         """Set both motors to forward direction with PWM speed control."""
         # Convert speed percentage to PWM duty cycle (0-65535)
-        duty_cycle = int((speed_percent / 100.0) * 0xFFFF)
+        # speed_percent vine din joystick (0 la 100)
+        # Vrem ca 0% joystick -> 25% putere (minim de mișcare)
+        # Vrem ca 100% joystick -> 100% putere (maxim hardware)
+
+        adjusted_speed = _PWM_MIN_PCT + (speed_percent * (_PWM_MAX_PCT - _PWM_MIN_PCT) / 100)
+
+        # Acum calculăm duty_cycle în siguranță
+        duty_cycle = int((adjusted_speed / 100.0) * 0xFFFF)
 
         # Motor A forward: IN1=HIGH, IN2=LOW, ENA=PWM
         self.pca.channels[self.motor_a_in1].duty_cycle = 0xFFFF  # HIGH
@@ -181,7 +196,14 @@ class RobotCarController:
     def _set_motor_backward(self, speed_percent: float):
         """Set both motors to backward direction with PWM speed control."""
         # Convert speed percentage to PWM duty cycle (0-65535)
-        duty_cycle = int((speed_percent / 100.0) * 0xFFFF)
+        # speed_percent vine din joystick (0 la 100)
+        # Vrem ca 0% joystick -> 25% putere (minim de mișcare)
+        # Vrem ca 100% joystick -> 100% putere (maxim hardware)
+
+        adjusted_speed = _PWM_MIN_PCT + (speed_percent * (_PWM_MAX_PCT - _PWM_MIN_PCT) / 100)
+
+        # Acum calculăm duty_cycle în siguranță
+        duty_cycle = int((adjusted_speed / 100.0) * 0xFFFF)
 
         # Motor A backward: IN1=LOW, IN2=HIGH, ENA=PWM
         self.pca.channels[self.motor_a_in1].duty_cycle = 0  # LOW

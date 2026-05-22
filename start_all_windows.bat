@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 REM ============================================================
 REM   WebRTC + MQTT Windows Launcher
 REM   Pornește automat toate componentele necesare
@@ -37,6 +38,22 @@ if errorlevel 1 (
 echo [OK] Virtual environment activated
 echo.
 
+echo [1.5/6] Cleaning up old processes (ports 8080, 1883)...
+powershell -NoProfile -Command ^
+    "$ports = @(8080, 1883); " ^
+    "foreach ($p in $ports) { " ^
+    "    Get-NetTCPConnection -LocalPort $p -State Listen -EA SilentlyContinue | " ^
+    "    Select-Object -ExpandProperty OwningProcess -Unique | " ^
+    "    Where-Object { $_ -gt 4 } | " ^
+    "    ForEach-Object { " ^
+    "        Write-Host ('Killing PID {0} on port {1}' -f $_, $p); " ^
+    "        Stop-Process -Id $_ -Force -EA SilentlyContinue " ^
+    "    } " ^
+    "}"
+timeout /t 1 >nul
+echo [OK] Ports 8080 and 1883 are clean
+echo.
+
 REM Verifică dacă mosquitto.conf există
 if not exist "receiver\mosquitto.conf" (
     echo [2/6] Creating mosquitto.conf...
@@ -64,16 +81,45 @@ if errorlevel 1 (
 )
 
 echo [3/6] Starting Mosquitto broker...
-cd receiver
-start "MQTT Broker" cmd /k "mosquitto -c mosquitto.conf -v"
-timeout /t 2 >nul
-echo [OK] Mosquitto started
+start "MQTT Broker" cmd /k "mosquitto -c receiver\mosquitto.conf -v"
+
+REM Asteapta activ pana la 10s
+set READY=0
+for /l %%i in (1,1,10) do (
+    if !READY!==0 (
+        netstat -ano | findstr :1883 | findstr LISTENING >nul
+        if not errorlevel 1 set READY=1
+        if !READY!==0 timeout /t 1 >nul
+    )
+)
+if !READY!==0 (
+    echo [ERROR] Mosquitto failed to start or bind to port 1883!
+    echo Check the newly opened Mosquitto window for error messages.
+    pause
+    exit /b 1
+)
+echo [OK] Mosquitto started successfully
 echo.
 
 echo [4/6] Starting Signaling Server...
-start "Signaling Server" cmd /k "python signaling_server.py"
-timeout /t 2 >nul
-echo [OK] Signaling server started
+start "Signaling Server" cmd /k "cd receiver && python signaling_server.py"
+
+REM Asteapta activ pana la 10s
+set READY=0
+for /l %%i in (1,1,10) do (
+    if !READY!==0 (
+        netstat -ano | findstr :8080 | findstr LISTENING >nul
+        if not errorlevel 1 set READY=1
+        if !READY!==0 timeout /t 1 >nul
+    )
+)
+if !READY!==0 (
+    echo [ERROR] Signaling server failed to start or bind to port 8080!
+    echo Check the newly opened Signaling Server window for error messages.
+    pause
+    exit /b 1
+)
+echo [OK] Signaling server started successfully
 echo.
 
 echo [5/6] Starting Receiver GUI...
@@ -93,10 +139,10 @@ echo.
 echo On Raspberry Pi, run:
 echo   python3 sender/sender_mqtt.py --video video.mp4 --server-ip YOUR_WINDOWS_IP --mqtt-broker YOUR_WINDOWS_IP
 echo.
-echo Press any key to start Receiver GUI...
-pause >nul
+echo Starting Receiver GUI...
 
 REM Pornește GUI în fereastra curentă
+cd receiver
 python receiver_gui_mqtt.py
 
 echo.

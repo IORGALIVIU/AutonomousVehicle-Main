@@ -7,3 +7,5 @@ paho-mqtt>=2.0.0
 picamera2>=0.3.16
 adafruit-circuitpython-pca9685>=3.4.0
 adafruit-circuitpython-motor>=3.4.0
+pyyaml>=6.0
+scipy>=1.11.0

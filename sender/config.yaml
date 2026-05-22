@@ -1,0 +1,65 @@
+# ============================================================
+#  Robot Car — Central Configuration
+#  Editează DOAR acest fișier pentru calibrare.
+#  Nu e necesar să atingi codul Python.
+# ============================================================
+
+camera:
+  width:  1920
+  height: 1080
+  fps:    30
+  process_width:  640    # Rezoluția internă de procesare OpenCV
+  process_height: 480    # Mai mică = mai rapid pe Pi 5
+
+pid:
+  kp:        1.5    # Gain proporțional — mai mare = reacție mai agresivă
+  ki:        0.012  # Gain integral — corectează drifturi persistente
+  kd:        0.35   # Gain derivativ — amortizează oscilaţiile
+  max_angle: 50.0   # Unghiul maxim de steering (grade)
+  alpha:     0.3    # Smoothing EMA: 0=ultra-neted, 1=fără smoothing
+
+speed:
+  base:  30.0  # Viteza de croazieră (%)
+  min:   25.0  # Viteza minimă în curbe (%)
+  max:   35.0  # Viteza maximă pe drept (%)
+
+hardware:
+  i2c_address:  0x7F   # Adresa I2C a PCA9685 (Seed Studio = 0x7F, standard = 0x40)
+  pwm_frequency: 50    # Frecvența PWM (Hz) — 50Hz standard pentru servo
+  servo_channel: 0     # Canalul PCA9685 pentru servo de steering
+  trim_offset:   10    # Grade de offset constructiv al servo (compensează roțile virate)
+  motor_a_in1:   1
+  motor_a_in2:   2
+  motor_a_ena:   3
+  motor_b_in3:   4
+  motor_b_in4:   5
+  motor_b_enb:   6
+  pwm_min_percent: 25  # Puterea minimă a motorului la 0% joystick (anti-stall)
+  pwm_max_percent: 100 # Puterea maximă la 100% joystick
+
+lane:
+  width_meters:   0.3   # Lățimea fizică a benzii (metri) — măsoară pe teren!
+  lookahead_frac: 0.50  # Fracție din imaginea bird's-eye: 0=departe, 1=aproape
+  roi_top_frac:   0.60  # ROI: de unde începe zona de interes (sus)
+  roi_left_frac:  0.05  # ROI: limita stângă
+  roi_right_frac: 0.95  # ROI: limita dreaptă
+
+lane_detection:
+  nwindows:         9    # Numărul de ferestre sliding
+  max_lost_frames:  5    # Frame-uri pierdute înainte de SEARCHING
+  peak_threshold_frac: 0.3  # Fracție din peak-ul global pentru detectare linie
+  max_window_jump:  80   # Max deplasare fereastră între frame-uri (px)
+  min_separation:   150  # Separare minimă între linii stânga/dreapta (px)
+  max_empty_windows: 2   # Ferestre consecutive fără pixeli înainte de abandon
+  # Parametrii HLS
+  s_thresh_min: 35
+  s_thresh_max: 255
+  l_thresh_min: 100
+  l_thresh_max: 255
+  morph_kernel_size: 5
+
+telemetry:
+  mqtt_hz:  10    # Frecvența de publicare MQTT (publicări/secundă)
+
+control:
+  loop_hz: 30    # Frecvența buclei PID (Hz) — dt = 1/loop_hz

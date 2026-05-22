@@ -23,8 +23,11 @@ from av import VideoFrame
 import paho.mqtt.client as mqtt
 import threading
 
-# Import signaling
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Ensure sender's own directory is first on sys.path so that
+# `from config import CFG` resolves to sender/config.py (not the root config.py)
+sys.path.insert(0, str(Path(__file__).parent))
+# Also add parent for common.signaling
+sys.path.insert(1, str(Path(__file__).parent.parent))
 from common.signaling import SignalingClient
 
 logging.basicConfig(
