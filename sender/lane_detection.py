@@ -34,7 +34,7 @@ class LaneDetector:
     def __init__(self, 
                  img_width=1920, 
                  img_height=1080,
-                 lane_width_meters=0.6,  # Physical lane width (adjust for your track)
+                 lane_width_meters=0.6,  # Physical lane width 
                  camera_height_meters=0.2):  # Camera height from ground
         """
         Initialize lane detector.
