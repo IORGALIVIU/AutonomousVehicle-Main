@@ -50,7 +50,8 @@ class AutonomousDriver:
                  img_height=1080,
                  enable_hardware=False,
                  show_visualization=True,
-                 draw_text=True):
+                 draw_text=True,
+                 mqtt_handler=None):
         """
         Initialize autonomous driver.
 
@@ -63,6 +64,7 @@ class AutonomousDriver:
         """
         self.img_width = img_width
         self.img_height = img_height
+        self.mqtt_handler = mqtt_handler
         self.enable_hardware = enable_hardware
         self.show_visualization = show_visualization
         self.draw_text = draw_text
@@ -307,6 +309,16 @@ class AutonomousDriver:
             )
             self.last_steering_angle = steering_angle
 
+        # Publică telemetria PID pe robot/pid_telemetry (grafic receiver)
+        if self.mqtt_handler is not None and offset is not None:
+            import time as _time
+            _norm = max(-1.0, min(1.0, offset / (PROCESS_WIDTH / 2.0)))
+            self.mqtt_handler.publish_pid_telemetry(
+                response=_norm,
+                steering_angle=steering_angle,
+                timestamp_ms=int(_time.time() * 1000),
+            )
+
         # Reset integral PID la recuperare din SEARCHING
         current_state = detection['detection_state']
         if self._prev_state == DetectionState.SEARCHING and current_state != DetectionState.SEARCHING:
@@ -337,13 +349,17 @@ class AutonomousDriver:
             annotated = cv2.resize(annotated_small, (self.img_width, self.img_height),
                                    interpolation=cv2.INTER_LINEAR)
             if self.draw_text:
-                rx = self.img_width - 520
+                scale = self.img_width / 1920.0
+                rx = self.img_width - int(520 * scale)
+                font_scale = max(0.4, 1.0 * scale)
+                thick = max(1, int(2 * scale))
+
                 cv2.putText(annotated, f"Angle detected: {raw_detected_angle:.1f} deg",
-                            (rx, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
+                            (rx, int(50 * scale)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 200, 255), thick)
                 cv2.putText(annotated, f"Steering (PID): {steering_angle:.1f} deg",
-                            (rx, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
+                            (rx, int(100 * scale)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 0), thick)
                 cv2.putText(annotated, f"Speed: {speed:.1f}%",
-                            (rx, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
+                            (rx, int(150 * scale)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 0), thick)
                 mode_colors = {
                     'both':       (0, 255, 0),
                     'left_only':  (0, 165, 255),
@@ -352,7 +368,7 @@ class AutonomousDriver:
                 }
                 mode_color = mode_colors.get(detection_mode, (255, 255, 255))
                 cv2.putText(annotated, f"MODE: {detection_mode.upper()}",
-                            (rx, 250), cv2.FONT_HERSHEY_SIMPLEX, 1.0, mode_color, 2)
+                            (rx, int(250 * scale)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, mode_color, thick)
 
         # Metrici de performanță
         processing_time = time.time() - start_time

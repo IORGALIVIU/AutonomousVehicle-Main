@@ -77,7 +77,7 @@ class PIDController:
             if self.prev_time is not None:
                 dt = current_time - self.prev_time
             else:
-                dt = 0.033  # Assume 30 FPS
+                dt = 0.033  # Fallback ~30 FPS
         self.prev_time = current_time
         
         # Normalize error to [-1, 1] range

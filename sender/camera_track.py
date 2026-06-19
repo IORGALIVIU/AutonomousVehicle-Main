@@ -19,7 +19,7 @@ from picamera2 import Picamera2
 from libcamera import controls
 import logging
 from autonomous_driver import AutonomousDriver
-from config import CFG, PROCESS_WIDTH, PROCESS_HEIGHT, TELEMETRY_HZ, TELEMETRY_INTERVAL
+from config import CFG, PROCESS_WIDTH, PROCESS_HEIGHT, TELEMETRY_HZ, TELEMETRY_INTERVAL, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class PiCameraTrackWithMQTT(VideoStreamTrack):
       - procesarea AI rulează în thread separat (AutonomousDriver)
     """
 
-    def __init__(self, width: int = 1920, height: int = 1080, fps: int = 30, mqtt_handler=None):
+    def __init__(self, width: int = CAMERA_WIDTH, height: int = CAMERA_HEIGHT, fps: int = CAMERA_FPS, mqtt_handler=None):
         super().__init__()
         self.width  = width
         self.height = height
@@ -77,8 +77,34 @@ class PiCameraTrackWithMQTT(VideoStreamTrack):
             img_height=height,
             enable_hardware=False,
             show_visualization=True,
-            draw_text=False
+            draw_text=False,
+            mqtt_handler=mqtt_handler  # pasăm handler-ul pentru publish_pid_telemetry
         )
+
+        # Timestamp tracking for custom FPS (aiortc hardcodes 30fps)
+        self._custom_start = None
+        self._custom_timestamp = None
+        self._VIDEO_CLOCK_RATE = 90000
+
+    async def next_timestamp(self):
+        """
+        Override aiortc's next_timestamp() to use self.target_fps
+        instead of the hardcoded VIDEO_PTIME = 1/30.
+        """
+        import asyncio
+        import fractions
+
+        if self._custom_timestamp is not None:
+            ptime = 1 / self.target_fps
+            self._custom_timestamp += int(self._VIDEO_CLOCK_RATE * ptime)
+            wait = self._custom_start + (self._custom_timestamp / self._VIDEO_CLOCK_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            self._custom_start = time.time()
+            self._custom_timestamp = 0
+
+        return self._custom_timestamp, fractions.Fraction(1, self._VIDEO_CLOCK_RATE)
 
     def get_system_stats(self):
         """Extrage utilizarea CPU, RAM și Temperatura."""
@@ -152,6 +178,9 @@ class PiCameraTrackWithMQTT(VideoStreamTrack):
             if current_time - self._last_telemetry_time >= TELEMETRY_INTERVAL:
                 self.mqtt_handler.publish_sensor_data(unghi, viteza, timestamp_ms)
                 self._last_telemetry_time = current_time
+
+            # Publish per-frame video timestamp la 30Hz (lightweight, pentru delay calc)
+            self.mqtt_handler.publish_video_timestamp(timestamp_ms)
 
         # ── Overlay text pe frame ─────────────────────────────────────────────
         font = cv2.FONT_HERSHEY_SIMPLEX

@@ -42,7 +42,7 @@ def _load_yaml(path: str) -> dict:
 # ── Valori implicite (oglindă a config.yaml) ──────────────────────────────────
 _DEFAULTS: dict = {
     "camera": {
-        "width": 1920, "height": 1080, "fps": 30,
+        "width": 1280, "height": 720, "fps": 30,
         "process_width": 640, "process_height": 480,
     },
     "pid": {

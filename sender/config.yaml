@@ -5,8 +5,8 @@
 # ============================================================
 
 camera:
-  width:  1920
-  height: 1080
+  width:  1280
+  height: 720
   fps:    30
   process_width:  640    # Rezoluția internă de procesare OpenCV
   process_height: 480    # Mai mică = mai rapid pe Pi 5
@@ -46,7 +46,7 @@ lane:
 
 lane_detection:
   nwindows:         9    # Numărul de ferestre sliding
-  max_lost_frames:  5    # Frame-uri pierdute înainte de SEARCHING
+  max_lost_frames:  8    # Frame-uri pierdute inainte de SEARCHING (~167ms la 30fps, scalat automat cu FPS)
   peak_threshold_frac: 0.3  # Fracție din peak-ul global pentru detectare linie
   max_window_jump:  80   # Max deplasare fereastră între frame-uri (px)
   min_separation:   150  # Separare minimă între linii stânga/dreapta (px)
@@ -62,4 +62,4 @@ telemetry:
   mqtt_hz:  10    # Frecvența de publicare MQTT (publicări/secundă)
 
 control:
-  loop_hz: 30    # Frecvența buclei PID (Hz) — dt = 1/loop_hz
+  loop_hz: 60    # Frecventa buclei PID (Hz) — trebuie sa fie >= camera fps

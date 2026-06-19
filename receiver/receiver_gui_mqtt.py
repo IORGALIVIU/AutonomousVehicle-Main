@@ -25,14 +25,28 @@ from tkinter import ttk, messagebox, scrolledtext
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
+import collections
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from av import VideoFrame
 import paho.mqtt.client as mqtt
 
-# Import signaling
+# Import signaling + sender config (pentru PROCESS_WIDTH/HEIGHT)
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "sender"))
 from common.signaling import SignalingClient
+try:
+    from lane_debug_viz import DebugLaneDetector
+    from config import PROCESS_WIDTH, PROCESS_HEIGHT
+    _LANE_DETECTOR_AVAILABLE = True
+except ImportError as _e:
+    logger.warning(f"DebugLaneDetector not available: {_e}")
+    _LANE_DETECTOR_AVAILABLE = False
+    PROCESS_WIDTH, PROCESS_HEIGHT = 640, 480
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +73,17 @@ class MQTTReceiverHandler:
         self.topic_publish_mod = "robot/control/mod"
         self.topic_publish_unghi = "robot/control/unghi_manual"
         self.topic_publish_viteza = "robot/control/viteza_manual"
+
+        # Clock sync topics (ping/pong)
+        self.topic_ping = "robot/ping"
+        self.topic_pong = "robot/pong"
+        self.clock_offset = 0  # offset = T_sender - T_receiver (ms)
+        self._ping_thread = None
+        self._ping_stop_event = threading.Event()
+
+        # Per-frame video timestamp topic
+        self.topic_video_ts = "robot/video_ts"
+        self.latest_video_timestamp = 0  # Updated at 30Hz by sender
 
         # Date realtime (unghi/viteza) — actualizate la fiecare frame
         self.sensor_data_buffer = {}
@@ -91,7 +116,9 @@ class MQTTReceiverHandler:
             self.connected = True
             client.subscribe(self.topic_subscribe_senzori)
             client.subscribe(self.topic_subscribe_sistem)
-            logger.info("MQTT: Subscribed to robot/senzori and robot/sistem")
+            client.subscribe(self.topic_pong)
+            client.subscribe(self.topic_video_ts)
+            logger.info("MQTT: Subscribed to robot/senzori, robot/sistem, robot/pong, robot/video_ts")
         else:
             logger.error(f"MQTT: Connection failed, code: {rc}")
             self.connected = False
@@ -151,6 +178,21 @@ class MQTTReceiverHandler:
                 if self.sistem_callback:
                     self.sistem_callback(self.latest_sistem_data)
 
+            elif topic == self.topic_pong:
+                # Clock sync: calculate RTT and offset
+                t_receiver_send = data.get("t_receiver_send", 0)
+                t_sender = data.get("t_sender", 0)
+                t_receiver_receive = int(time.time() * 1000)
+
+                rtt = t_receiver_receive - t_receiver_send
+                # offset = cât e ceasul sender-ului în avans față de receiver
+                self.clock_offset = t_sender - (t_receiver_send + rtt // 2)
+                logger.info(f"[MQTT SYNC] RTT={rtt}ms, Clock Offset={self.clock_offset}ms")
+
+            elif topic == self.topic_video_ts:
+                # Per-frame video timestamp de la sender (30Hz)
+                self.latest_video_timestamp = data.get("ts", 0)
+
         except json.JSONDecodeError:
             logger.error(f"MQTT: JSON decode error: {payload}")
         except Exception as e:
@@ -184,6 +226,34 @@ class MQTTReceiverHandler:
         except Exception as e:
             logger.error(f"MQTT: Connection error: {e}")
             return False
+
+    def _ping_loop(self):
+        """Background thread that sends clock sync pings every 5 seconds."""
+        while not self._ping_stop_event.is_set():
+            if self.connected and self.client:
+                t_receiver_send = int(time.time() * 1000)
+                ping_payload = json.dumps({"t_receiver_send": t_receiver_send})
+                try:
+                    self.client.publish(self.topic_ping, ping_payload)
+                except Exception as e:
+                    logger.warning(f"MQTT SYNC: Ping send error: {e}")
+            self._ping_stop_event.wait(5)
+
+    def start_ping_loop(self):
+        """Start the clock sync ping loop in a background thread."""
+        if self._ping_thread is not None:
+            return
+        self._ping_stop_event.clear()
+        self._ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
+        self._ping_thread.start()
+        logger.info("MQTT SYNC: Ping loop started (every 5s)")
+
+    def stop_ping_loop(self):
+        """Stop the clock sync ping loop."""
+        self._ping_stop_event.set()
+        if self._ping_thread:
+            self._ping_thread.join(timeout=2)
+            self._ping_thread = None
 
     def get_sensor_data_at_timestamp(self, timestamp: int, tolerance_ms: int = 100):
         """Get sensor data closest to given timestamp."""
@@ -269,6 +339,11 @@ class VideoReceiverGUI_MQTT:
         self.frame_queue = queue.Queue(maxsize=10)
         self.current_frame_timestamp = 0
 
+        # Flag pentru log unic "MQTT not connected"
+        self._mqtt_not_connected_logged = False
+        # Ultimele valori sistem logate (pentru a evita spam)
+        self._last_sistem_log = ""
+
         # Stats
         self.stats = {
             "frames_received": 0,
@@ -280,6 +355,9 @@ class VideoReceiverGUI_MQTT:
             "video_delay_ms": 0,
             "mqtt_delay_ms": 0
         }
+
+        # Lane Detector — init dupa _setup_ui (necesita debug_status_label)
+        self._local_lane_detector = None
 
         # MQTT Handler
         self.mqtt_handler = MQTTReceiverHandler(mqtt_broker)
@@ -317,11 +395,32 @@ class VideoReceiverGUI_MQTT:
         self.loop = None
         self.loop_thread = None
 
+        # PID telemetry
+        self.pid_data_queue: queue.Queue = queue.Queue(maxsize=2000)
+        self._mqtt_pid_client = None
+        self._mqtt_pid_connected = False
+        self._pid_graph_window = None
+
+        # Debug visualization windows
+        self._birds_eye_window = None
+        self._sliding_window_window = None
+        self._debug_input_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._birds_eye_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._sliding_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._debug_thread_running = False
+        self._debug_thread = None
+
         # Setup GUI
         self._setup_ui()
 
+        # Init lane detector (dupa _setup_ui — necesita debug_status_label)
+        self._init_local_lane_detector()
+
         # Start asyncio loop
         self._start_async_loop()
+
+        # Start MQTT PID subscriber (topic robot/pid_telemetry)
+        self._start_mqtt_pid_subscriber()
 
         # Update loops
         self._update_video_display()
@@ -329,6 +428,13 @@ class VideoReceiverGUI_MQTT:
 
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _init_local_lane_detector(self):
+        if _LANE_DETECTOR_AVAILABLE:
+            self._local_lane_detector = DebugLaneDetector(
+                img_width=PROCESS_WIDTH,
+                img_height=PROCESS_HEIGHT,
+            )
 
     def _setup_ui(self):
         """Setup GUI layout."""
@@ -380,7 +486,19 @@ class VideoReceiverGUI_MQTT:
         content_frame = ttk.Frame(self.root)
         content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # Left: Video
+        # Ordinea de pack in tkinter conteaza:
+        # Coloanele fixe se pun cu side=RIGHT intai, altfel left_frame
+        # cu expand=True le inghite spatiul.
+
+        # Right: Control Panel + Stats + Sensor Data  (pus primul — rightmost)
+        right_frame = ttk.Frame(content_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+
+        # Middle: Debug Tools  (pus al doilea cu RIGHT — apare la stanga coloanei drepte)
+        middle_frame = ttk.Frame(content_frame)
+        middle_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+
+        # Left: Video (pus ultimul cu LEFT + expand=True — umple restul)
         left_frame = ttk.Frame(content_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
 
@@ -391,9 +509,45 @@ class VideoReceiverGUI_MQTT:
         self.video_label = ttk.Label(video_frame, text="No video stream")
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Right: Control Panel + Stats + Sensor Data
-        right_frame = ttk.Frame(content_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+
+        # --- Debug Tools ---
+        debug_panel = ttk.LabelFrame(middle_frame, text="Debug Tools")
+        debug_panel.pack(side=tk.TOP, fill=tk.X, pady=(5, 3))
+
+        self.birds_eye_btn = ttk.Button(
+            debug_panel,
+            text="Bird's Eye (binary)",
+            command=self._open_birds_eye_window,
+        )
+        self.birds_eye_btn.pack(fill=tk.X, padx=8, pady=(8, 3))
+
+        self.sliding_win_btn = ttk.Button(
+            debug_panel,
+            text="Sliding Window",
+            command=self._open_sliding_window_window,
+        )
+        self.sliding_win_btn.pack(fill=tk.X, padx=8, pady=(0, 3))
+
+        self.debug_status_label = ttk.Label(
+            debug_panel, text="Detector: --", foreground="gray", font=("Arial", 8)
+        )
+        self.debug_status_label.pack(anchor=tk.W, padx=8, pady=(0, 6))
+
+        # --- PID Telemetry (mutat din panoul drept) ---
+        pid_panel = ttk.LabelFrame(middle_frame, text="PID Telemetry")
+        pid_panel.pack(side=tk.TOP, fill=tk.X, pady=(3, 5))
+
+        self.pid_graph_btn = ttk.Button(
+            pid_panel,
+            text="Open PID Graph",
+            command=self._open_pid_graph,
+        )
+        self.pid_graph_btn.pack(fill=tk.X, padx=8, pady=(8, 3))
+
+        self.pid_mqtt_status_label = ttk.Label(
+            pid_panel, text="MQTT PID: --", foreground="gray", font=("Arial", 8)
+        )
+        self.pid_mqtt_status_label.pack(anchor=tk.W, padx=8, pady=(0, 6))
 
         # Control panel
         control_panel = ttk.LabelFrame(right_frame, text="Control Commands")
@@ -458,7 +612,8 @@ class VideoReceiverGUI_MQTT:
             label = ttk.Label(stats_frame, text=f"{label_text}:")
             label.grid(row=i, column=0, sticky=tk.W, padx=10, pady=5)
 
-            value_label = ttk.Label(stats_frame, text="N/A", foreground="blue")
+            value_label = ttk.Label(stats_frame, text="N/A", foreground="blue",
+                                    font=("Arial", 10))
             value_label.grid(row=i, column=1, sticky=tk.W, padx=10, pady=5)
 
             self.stats_labels[key] = value_label
@@ -472,17 +627,17 @@ class VideoReceiverGUI_MQTT:
 
         # --- Realtime ---
         ttk.Label(sensor_grid, text="Angle:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_angle, foreground="blue", font=("Arial", 11, "bold")).grid(
+        ttk.Label(sensor_grid, textvariable=self.sensor_angle, foreground="blue", font=("Arial", 10)).grid(
             row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(sensor_grid, text="°").grid(row=0, column=2, sticky=tk.W)
 
         ttk.Label(sensor_grid, text="Speed:").grid(row=1, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_speed, foreground="blue", font=("Arial", 11, "bold")).grid(
+        ttk.Label(sensor_grid, textvariable=self.sensor_speed, foreground="blue", font=("Arial", 10)).grid(
             row=1, column=1, sticky=tk.W, padx=5)
         ttk.Label(sensor_grid, text="RPM").grid(row=1, column=2, sticky=tk.W)
 
         ttk.Label(sensor_grid, text="Timestamp:").grid(row=2, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_timestamp, foreground="blue", font=("Arial", 11)).grid(row=2,
+        ttk.Label(sensor_grid, textvariable=self.sensor_timestamp, foreground="blue", font=("Arial", 10)).grid(row=2,
                                                                                                                column=1,
                                                                                                                columnspan=2,
                                                                                                                sticky=tk.W,
@@ -495,28 +650,30 @@ class VideoReceiverGUI_MQTT:
 
         # --- Sistem lent ---
         ttk.Label(sensor_grid, text="CPU:").grid(row=5, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_cpu, foreground="blue", font=("Arial", 11, "bold")).grid(row=5,
+        ttk.Label(sensor_grid, textvariable=self.sensor_cpu, foreground="blue", font=("Arial", 10)).grid(row=5,
                                                                                                                  column=1,
                                                                                                                  sticky=tk.W,
                                                                                                                  padx=5)
 
         ttk.Label(sensor_grid, text="RAM:").grid(row=6, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_ram, foreground="blue", font=("Arial", 11, "bold")).grid(row=6,
+        ttk.Label(sensor_grid, textvariable=self.sensor_ram, foreground="blue", font=("Arial", 10)).grid(row=6,
                                                                                                                  column=1,
                                                                                                                  sticky=tk.W,
                                                                                                                  padx=5)
 
         ttk.Label(sensor_grid, text="Temp:").grid(row=7, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_temp, foreground="blue", font=("Arial", 11, "bold")).grid(row=7,
+        ttk.Label(sensor_grid, textvariable=self.sensor_temp, foreground="blue", font=("Arial", 10)).grid(row=7,
                                                                                                                   column=1,
                                                                                                                   sticky=tk.W,
                                                                                                                   padx=5)
 
         ttk.Label(sensor_grid, text="Battery:").grid(row=8, column=0, sticky=tk.W, padx=5)
-        ttk.Label(sensor_grid, textvariable=self.sensor_battery, foreground="blue", font=("Arial", 11, "bold")).grid(
+        ttk.Label(sensor_grid, textvariable=self.sensor_battery, foreground="blue", font=("Arial", 10)).grid(
             row=8, column=1, sticky=tk.W, padx=5)
         ttk.Label(sensor_grid, textvariable=self.sensor_bat_info, foreground="gray",
                   font=("Arial", 9)).grid(row=9, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # PID Graph button a fost mutat in coloana middle (debug_panel)
 
         # Log area - bigger now with more space available
         log_frame = ttk.LabelFrame(self.root, text="Logs")
@@ -589,22 +746,18 @@ class VideoReceiverGUI_MQTT:
         """Callback pentru robot/senzori — date realtime (unghi, viteza)."""
         current_time_ms = int(time.time() * 1000)
         data_timestamp = sensor_data.get('timestamp', current_time_ms)
-        data_age_ms = current_time_ms - data_timestamp
+
+        # Corectam timestamp-ul sender-ului cu offset-ul de ceas calculat prin ping/pong
+        clock_offset = self.mqtt_handler.clock_offset
+        corrected_sender_time = data_timestamp - clock_offset
+        data_age_ms = max(0, current_time_ms - corrected_sender_time)
 
         self.stats["mqtt_delay_ms"] = data_age_ms
-
-        if data_age_ms > 500:
-            self._log(f"⚠️  MQTT data is {data_age_ms}ms old (delay!)")
-        elif data_age_ms > 200:
-            self._log(f"⚠️  MQTT data age: {data_age_ms}ms")
-        else:
-            self._log(f"Senzori: unghi={sensor_data.get('unghi', 'N/A')}, viteza={sensor_data.get('viteza', 'N/A')}")
 
         def update_gui():
             self.sensor_angle.set(f"{sensor_data['unghi']:.1f}")
             self.sensor_speed.set(f"{sensor_data['viteza']:.1f}")
-            age_indicator = " ⚠️" if data_age_ms > 500 else (" ⏱" if data_age_ms > 200 else "")
-            self.sensor_timestamp.set(f"{data_timestamp}{age_indicator}")
+            self.sensor_timestamp.set(f"{data_timestamp}")
 
         self.root.after(0, update_gui)
 
@@ -614,12 +767,19 @@ class VideoReceiverGUI_MQTT:
         bat_v = sistem_data.get('bat_voltage', 0.0)
         bat_i = sistem_data.get('bat_current', 0.0)
         bat_pct = sistem_data.get('battery', 0.0)
-        charge_icon = "↑" if charging else "↓"
+        charge_icon = "+" if charging else "-"
 
-        self._log(f"Sistem: CPU={sistem_data.get('cpu_usage', 0):.1f}%"
-                  f" RAM={sistem_data.get('ram_usage', 0):.1f}%"
-                  f" Temp={sistem_data.get('temperature', 0):.1f}°C"
-                  f" Bat={bat_pct:.1f}% {charge_icon} ({bat_v:.2f}V, {bat_i:.0f}mA)")
+        # Logam doar daca valorile s-au modificat semnificativ
+        sistem_summary = (f"CPU={sistem_data.get('cpu_usage', 0):.0f}%"
+                          f" RAM={sistem_data.get('ram_usage', 0):.0f}%"
+                          f" Temp={sistem_data.get('temperature', 0):.0f}C"
+                          f" Bat={bat_pct:.0f}% {charge_icon}")
+        if sistem_summary != self._last_sistem_log:
+            self._last_sistem_log = sistem_summary
+            self._log(f"Sistem: CPU={sistem_data.get('cpu_usage', 0):.1f}%"
+                      f" RAM={sistem_data.get('ram_usage', 0):.1f}%"
+                      f" Temp={sistem_data.get('temperature', 0):.1f}C"
+                      f" Bat={bat_pct:.1f}% ({bat_v:.2f}V, {bat_i:.0f}mA)")
 
         def update_gui():
             self.sensor_cpu.set(f"{sistem_data.get('cpu_usage', 0):.1f} %")
@@ -658,9 +818,14 @@ class VideoReceiverGUI_MQTT:
     def _send_all_commands(self):
         """Send all control commands."""
         if not self.mqtt_handler.connected:
-            self._log("MQTT not connected!")
-            self.last_command_label.config(text="ERROR: MQTT not connected", foreground="red")
+            if not self._mqtt_not_connected_logged:
+                self._log("MQTT not connected!")
+                self.last_command_label.config(text="ERROR: MQTT not connected", foreground="red")
+                self._mqtt_not_connected_logged = True
             return
+
+        # Reset flag-ul cand suntem reconectati
+        self._mqtt_not_connected_logged = False
 
         mode = self.control_mode.get()
         angle = self.control_angle.get()
@@ -672,7 +837,7 @@ class VideoReceiverGUI_MQTT:
 
         mode_text = "Manual" if mode == 1 else "Auto"
         command_str = f"{mode_text}, {angle:.0f}°, {speed:.0f} RPM"
-        self._log(f"Commands sent: {command_str}")
+        # Dezactivam logarea la fiecare trimitere pentru a evita blocarea GUI (spam la 60 Hz)
         self.last_command_label.config(text=command_str, foreground="green")
 
     def _start_async_loop(self):
@@ -704,6 +869,8 @@ class VideoReceiverGUI_MQTT:
                 self._log("MQTT connected successfully")
                 self.root.after(0, lambda: self.mqtt_status.config(
                     text="MQTT: Connected", foreground="green"))
+                # Start clock sync ping loop
+                self.mqtt_handler.start_ping_loop()
                 # Send the initial manual mode command to sync with robot
                 self.root.after(0, self._send_all_commands)
             else:
@@ -797,6 +964,7 @@ class VideoReceiverGUI_MQTT:
             self.pc = None
 
         if self.mqtt_handler:
+            self.mqtt_handler.stop_ping_loop()
             self.mqtt_handler.disconnect()
 
         self.is_connected = False
@@ -829,8 +997,11 @@ class VideoReceiverGUI_MQTT:
                 # Store with timestamp (try to extract from frame or use current)
                 self.current_frame_timestamp = int(current_time * 1000)
                 
-                # Aproximeaza momentul trimiterii preluand cel mai recent timestamp MQTT
-                sender_timestamp = self.mqtt_handler.latest_sensor_data.get("timestamp", 0)
+                # Folosim timestamp-ul video per-frame (30Hz) în loc de cel de senzori (10Hz)
+                sender_timestamp = self.mqtt_handler.latest_video_timestamp
+                if sender_timestamp == 0:
+                    # Fallback la timestamp-ul de senzori dacă video_ts nu e disponibil
+                    sender_timestamp = self.mqtt_handler.latest_sensor_data.get("timestamp", 0)
 
                 # Put frame in queue
                 try:
@@ -849,7 +1020,18 @@ class VideoReceiverGUI_MQTT:
     def _update_video_display(self):
         """Update video display with latest sensor data."""
         try:
-            frame_data = self.frame_queue.get_nowait()
+            frame_data = None
+            # Drenăm coada pentru a prelua doar cel mai recent cadru disponibil
+            while True:
+                try:
+                    frame_data = self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            if frame_data is None:
+                # Nu există cadru nou în coadă, replanificăm verificarea
+                self.root.after(33, self._update_video_display)
+                return
 
             if isinstance(frame_data, tuple) and len(frame_data) == 2:
                 frame, sender_timestamp = frame_data
@@ -857,21 +1039,22 @@ class VideoReceiverGUI_MQTT:
                 frame = frame_data
                 sender_timestamp = 0
 
-            # Calculam Video Delay
+            # Calculam Video Delay (corectat cu clock offset)
             current_time_ms = int(time.time() * 1000)
             if sender_timestamp > 0:
-                video_delay_ms = current_time_ms - sender_timestamp
+                clock_offset = self.mqtt_handler.clock_offset
+                corrected_sender_time = sender_timestamp - clock_offset
+                video_delay_ms = max(0, current_time_ms - corrected_sender_time)
                 self.stats["video_delay_ms"] = video_delay_ms
-                
-                # Trimitem warning-uri
-                if video_delay_ms > 500:
-                    self._log(f"⚠️  VIDEO delay: {video_delay_ms}ms (întârziere afișare!)")
             else:
                 self.stats["video_delay_ms"] = "N/A"
 
             # Use latest sensor data from MQTT (already updated by callback)
             # No need for complex timestamp synchronization - MQTT callback
             # updates sensor_angle/speed/timestamp in real-time
+
+            # Feed frame to local lane detection debug processor
+            self._feed_debug_frame(frame)
 
             # Resize and display
             display_height = 500
@@ -886,18 +1069,25 @@ class VideoReceiverGUI_MQTT:
             self.video_label.config(image=img_tk)
             self.video_label.image = img_tk
 
-        except queue.Empty:
-            pass
         except Exception as e:
             logger.error(f"Error updating video: {e}")
 
         self.root.after(33, self._update_video_display)
 
     def _update_stats_display(self):
-        """Update statistics display."""
+        """Update statistics display with warning indicators for high delays."""
         for key, label in self.stats_labels.items():
             value = self.stats.get(key, "N/A")
-            label.config(text=str(value))
+            # Color-code delay values
+            if key in ("video_delay_ms", "mqtt_delay_ms") and isinstance(value, (int, float)):
+                if value > 400:
+                    label.config(text=f"!! {value}", foreground="red")
+                elif value > 200:
+                    label.config(text=f"! {value}", foreground="orange")
+                else:
+                    label.config(text=str(value), foreground="green")
+            else:
+                label.config(text=str(value))
 
         self.root.after(500, self._update_stats_display)
 
@@ -918,18 +1108,554 @@ class VideoReceiverGUI_MQTT:
                 foreground="red"
             )
 
+    def _start_mqtt_pid_subscriber(self):
+        """Conecteaza un client MQTT dedicat pentru topicul robot/pid_telemetry."""
+        # Throttle log: un mesaj GUI la fiecare 1 secunda
+        self._pid_last_log_time = 0.0
+        self._pid_packets_total = 0
+
+        try:
+            client = mqtt.Client(
+                client_id="receiver_gui_pid_mqtt",
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+            )
+
+            def on_connect(c, userdata, flags, rc):
+                if rc == 0:
+                    self._mqtt_pid_connected = True
+                    c.subscribe("robot/pid_telemetry", qos=0)
+                    self.root.after(0, self._refresh_pid_mqtt_label)
+                    self.root.after(0, lambda: self._log(
+                        "[PID] ✅ MQTT PID conectat — subscris pe robot/pid_telemetry"
+                    ))
+                else:
+                    self.root.after(0, lambda: self._log(
+                        f"[PID] ❌ MQTT PID connect esuat rc={rc}"
+                    ))
+
+            def on_disconnect(c, userdata, rc):
+                self._mqtt_pid_connected = False
+                self.root.after(0, self._refresh_pid_mqtt_label)
+                self.root.after(0, lambda: self._log("[PID] ⚠️  MQTT PID deconectat"))
+                if self._pid_graph_window and self._pid_graph_window.alive:
+                    self.root.after(0, self._pid_graph_window.freeze)
+
+            def on_message(c, userdata, msg):
+                try:
+                    data = json.loads(msg.payload.decode())
+                    self._pid_packets_total += 1
+
+                    # Pune in coada pentru grafic
+                    try:
+                        self.pid_data_queue.put_nowait(data)
+                    except queue.Full:
+                        try:
+                            self.pid_data_queue.get_nowait()
+                            self.pid_data_queue.put_nowait(data)
+                        except Exception:
+                            pass
+
+                    # Log in GUI throttled la 1s
+                    now = time.time()
+                    if now - self._pid_last_log_time >= 1.0:
+                        self._pid_last_log_time = now
+                        resp  = data.get("response", 0.0)
+                        steer = data.get("steering_angle", 0.0)
+                        total = self._pid_packets_total
+                        self.root.after(0, lambda r=resp, s=steer, t=total: self._log(
+                            f"[PID] 📊 response={r:+.3f}  steering={s:+.1f}°  "
+                            f"(total pachete: {t})"
+                        ))
+                except Exception as e:
+                    logger.debug(f"[MQTT PID] parse error: {e}")
+
+            client.on_connect = on_connect
+            client.on_disconnect = on_disconnect
+            client.on_message = on_message
+
+            client.connect_async(self.mqtt_broker, 1883, keepalive=60)
+            client.loop_start()
+            self._mqtt_pid_client = client
+            self._log(f"[PID] 🔌 Se conectează MQTT PID la {self.mqtt_broker}:1883...")
+        except Exception as e:
+            self._log(f"[PID] ❌ Nu s-a putut porni subscriber MQTT PID: {e}")
+
+    def _refresh_pid_mqtt_label(self):
+        """Actualizeaza indicatorul de stare MQTT PID."""
+        if self._mqtt_pid_connected:
+            self.pid_mqtt_status_label.config(
+                text="● MQTT PID: OK", foreground="green"
+            )
+        else:
+            self.pid_mqtt_status_label.config(
+                text="● MQTT PID: OFF", foreground="red"
+            )
+
+    def _open_pid_graph(self):
+        """Deschide fereastra grafic PID (sau o aduce in fata daca exista)."""
+        if self._pid_graph_window and self._pid_graph_window.alive:
+            self._pid_graph_window.window.lift()
+            return
+        # Golim coada de date vechi la fiecare deschidere
+        while not self.pid_data_queue.empty():
+            try:
+                self.pid_data_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._pid_graph_window = PIDGraphWindow(
+            parent=self.root,
+            data_queue=self.pid_data_queue,
+            mqtt_connected_fn=lambda: self._mqtt_pid_connected,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # METODE DEBUG VISUALIZATION
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _start_debug_thread(self):
+        """Pornește thread-ul de procesare debug dacă nu rulează deja."""
+        if self._debug_thread_running:
+            return
+        if self._local_lane_detector is None:
+            self._log("[Debug] ❌ Detectorul local nu este initializat.")
+            return
+        self._debug_thread_running = True
+        self._debug_thread = threading.Thread(
+            target=self._debug_processing_loop,
+            name="DebugViz-Worker",
+            daemon=True
+        )
+        self._debug_thread.start()
+        self._log("[Debug] Thread de procesare vizualizare pornit")
+
+    def _stop_debug_thread(self):
+        """Oprește thread-ul de procesare debug."""
+        self._debug_thread_running = False
+
+    def _feed_debug_frame(self, frame):
+        """Trimite un frame către thread-ul de procesare debug (non-blocant).
+        Apelat din _update_video_display() doar dacă o fereastră debug e deschisă."""
+        be_open  = self._birds_eye_window and self._birds_eye_window.alive
+        sw_open  = self._sliding_window_window and self._sliding_window_window.alive
+
+        if not (be_open or sw_open):
+            return  # nicio fereastră deschisă — nu procesam
+
+        try:
+            self._debug_input_queue.put_nowait(frame.copy())
+        except queue.Full:
+            try:
+                self._debug_input_queue.get_nowait()
+                self._debug_input_queue.put_nowait(frame.copy())
+            except Exception:
+                pass
+
+    def _debug_processing_loop(self):
+        """
+        Thread background: preia frame-uri din _debug_input_queue,
+        le procesează prin LaneDetector local la max 10fps și pune
+        rezultatele în cozile respective.
+        """
+        import time as _time
+        last_proc = 0.0
+        INTERVAL = 0.10  # 10 fps max
+
+        while self._debug_thread_running:
+            try:
+                frame = self._debug_input_queue.get(timeout=0.15)
+            except queue.Empty:
+                continue
+
+            now = _time.time()
+            if now - last_proc < INTERVAL:
+                continue
+            last_proc = now
+
+            det = self._local_lane_detector
+            if det is None:
+                continue
+
+            # Resize la rezoluția de procesare (identic cu ce face Pi-ul)
+            small = cv2.resize(frame, (PROCESS_WIDTH, PROCESS_HEIGHT))
+
+            be_open = self._birds_eye_window and self._birds_eye_window.alive
+            sw_open = self._sliding_window_window and self._sliding_window_window.alive
+
+            if be_open:
+                img = det.get_birds_eye_visualization(small)
+                if img is not None:
+                    try:
+                        self._birds_eye_queue.put_nowait(img)
+                    except queue.Full:
+                        try:
+                            self._birds_eye_queue.get_nowait()
+                            self._birds_eye_queue.put_nowait(img)
+                        except Exception:
+                            pass
+
+            if sw_open:
+                img = det.get_sliding_window_visualization(small)
+                if img is not None:
+                    try:
+                        self._sliding_queue.put_nowait(img)
+                    except queue.Full:
+                        try:
+                            self._sliding_queue.get_nowait()
+                            self._sliding_queue.put_nowait(img)
+                        except Exception:
+                            pass
+
+    def _open_birds_eye_window(self):
+        """Deschide fereastra Bird's Eye (sau o aduce în față)."""
+        if self._birds_eye_window and self._birds_eye_window.alive:
+            self._birds_eye_window.window.lift()
+            return
+        if self._local_lane_detector is None:
+            self._init_local_lane_detector()
+        self._start_debug_thread()
+        self._birds_eye_window = DebugVideoWindow(
+            parent=self.root,
+            title="🗯️ Bird's Eye — Binary Warped",
+            data_queue=self._birds_eye_queue,
+            color_hint="alb=pixeli bandă  |  negru=fundal",
+        )
+
+    def _open_sliding_window_window(self):
+        """Deschide fereastra Sliding Window (sau o aduce în față)."""
+        if self._sliding_window_window and self._sliding_window_window.alive:
+            self._sliding_window_window.window.lift()
+            return
+        if self._local_lane_detector is None:
+            self._init_local_lane_detector()
+        self._start_debug_thread()
+        self._sliding_window_window = DebugVideoWindow(
+            parent=self.root,
+            title="🔍 Sliding Window — Lane Search",
+            data_queue=self._sliding_queue,
+            color_hint="roșu=stânga  |  albastru=dreapta  |  galben/cyan=ferestre  |  verde=polinoame",
+        )
+
     def _on_closing(self):
         """Handle window close."""
+        self._stop_debug_thread()
         if self.is_connected or self.mqtt_handler.connected:
             if messagebox.askokcancel("Quit", "Close connections and quit?"):
                 self._run_async(self._disconnect())
                 if self.loop:
                     self.loop.call_soon_threadsafe(self.loop.stop)
+                if self._mqtt_pid_client:
+                    self._mqtt_pid_client.loop_stop()
+                    self._mqtt_pid_client.disconnect()
                 self.root.destroy()
         else:
             if self.loop:
                 self.loop.call_soon_threadsafe(self.loop.stop)
+            if self._mqtt_pid_client:
+                self._mqtt_pid_client.loop_stop()
+                self._mqtt_pid_client.disconnect()
             self.root.destroy()
+
+# =============================================================================
+# Debug Video Window — Bird's Eye / Sliding Window
+# =============================================================================
+
+class DebugVideoWindow:
+    """
+    Fereastra pop-up care afișează un flux video debug în timp real.
+    Primește imagini RGB pre-procesate prin data_queue și le afișează
+    continuu (ca un videoclip), la max ~10fps.
+    """
+    UPDATE_MS = 100  # 10 Hz refresh
+
+    def __init__(self, parent: tk.Tk, title: str,
+                 data_queue: queue.Queue, color_hint: str = ""):
+        self.data_queue = data_queue
+        self.alive = True
+        self._photo = None  # referință reținută pentru garbage collector
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.geometry("700x560")
+        self.window.configure(bg="#1a1a2e")
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Canvas pentru imagine
+        self.canvas = tk.Canvas(
+            self.window, bg="#0f0f1a", highlightthickness=0
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
+
+        # Bara de status
+        bar = tk.Frame(self.window, bg="#16213e", relief=tk.GROOVE, bd=1)
+        bar.pack(fill=tk.X, padx=6, pady=6)
+
+        self.lbl_status = tk.Label(
+            bar, text="⏳ Aștept frame-uri...",
+            fg="#e0e0e0", bg="#16213e", font=("Consolas", 9)
+        )
+        self.lbl_status.pack(side=tk.LEFT, padx=(8, 20))
+
+        self.lbl_fps = tk.Label(
+            bar, text="FPS: --",
+            fg="#00e676", bg="#16213e", font=("Consolas", 9)
+        )
+        self.lbl_fps.pack(side=tk.LEFT, padx=(0, 20))
+
+        if color_hint:
+            tk.Label(
+                bar, text=color_hint,
+                fg="#90a4ae", bg="#16213e", font=("Consolas", 8)
+            ).pack(side=tk.RIGHT, padx=10)
+
+        self._frame_count = 0
+        self._fps_time = time.time()
+        self._last_fps = 0.0
+
+        self._schedule_update()
+
+    def _schedule_update(self):
+        if self.alive:
+            try:
+                self._update()
+            except Exception as e:
+                logger.debug(f"Error in DebugVideoWindow update: {e}")
+            if self.alive:
+                self.window.after(self.UPDATE_MS, self._schedule_update)
+
+    def _update(self):
+        """Drenează coada și afișează cel mai recent frame disponibil."""
+        if not self.alive:
+            return
+
+        latest = None
+        while True:
+            try:
+                latest = self.data_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest is None:
+            return  # niciun frame nou — păstrăm imaginea anterioară
+
+        try:
+            # Calcul FPS
+            self._frame_count += 1
+            now = time.time()
+            elapsed = now - self._fps_time
+            if elapsed >= 1.0:
+                self._last_fps = self._frame_count / elapsed
+                self._frame_count = 0
+                self._fps_time = now
+
+            # Scalăm imaginea să umple canvas-ul, menținând aspect ratio
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cw < 10 or ch < 10:
+                cw, ch = 640, 480
+
+            h, w = latest.shape[:2]
+            scale = min(cw / w, ch / h)
+            nw, nh = int(w * scale), int(h * scale)
+            if nw > 0 and nh > 0:
+                # Folosim INTER_NEAREST pentru performanță maximă (mult mai rapid decât INTER_LINEAR)
+                resized = cv2.resize(latest, (nw, nh), interpolation=cv2.INTER_NEAREST)
+                img_pil = Image.fromarray(resized)
+                self._photo = ImageTk.PhotoImage(image=img_pil)
+                self.canvas.delete("all")
+                x_off = (cw - nw) // 2
+                y_off = (ch - nh) // 2
+                self.canvas.create_image(x_off, y_off, anchor=tk.NW, image=self._photo)
+
+            # Actualizăm bara de status
+            self.lbl_status.config(text=f"✅ Live  {w}x{h}")
+            self.lbl_fps.config(text=f"FPS: {self._last_fps:.1f}")
+        except (tk.TclError, Exception) as e:
+            logger.debug(f"DebugVideoWindow redraw error: {e}")
+
+    def _on_close(self):
+        self.alive = False
+        self.window.destroy()
+
+
+# =============================================================================
+# PID Graph Window
+# =============================================================================
+
+class PIDGraphWindow:
+    """
+    Fereastra pop-up cu grafic in timp real al controlului PID.
+    Arata raspunsul sistemului (offset normalizat [-1, 1]) pe 30 secunde derulante.
+    Util pentru Ziegler-Nichols: Ku = Kp la oscilatie sustinuta, Tu = perioada.
+    """
+    WINDOW_SECONDS = 30
+    UPDATE_MS      = 200   # 5 Hz redraw — reduce CPU
+    MAX_POINTS     = WINDOW_SECONDS * 100  # Suportă până la 100 Hz (e.g. 30Hz sau 60Hz FPS) fără pierderi pe stânga graficului
+
+    def __init__(self, parent: tk.Tk, data_queue: queue.Queue, mqtt_connected_fn):
+        self.data_queue        = data_queue
+        self.mqtt_connected_fn = mqtt_connected_fn
+        self.alive             = True
+        self.frozen            = False
+
+        self.times     = collections.deque(maxlen=self.MAX_POINTS)
+        self.responses = collections.deque(maxlen=self.MAX_POINTS)
+        self.start_ts  = None
+
+        # Fereastra Toplevel
+        self.window = tk.Toplevel(parent)
+        self.window.title("📈 PID Real-Time Graph — Ziegler-Nichols Analysis")
+        self.window.geometry("1050x620")
+        self.window.configure(bg="#f0f0f0")
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Matplotlib Figure — dpi redus pentru a usura CPU-ul
+        self.fig = Figure(figsize=(10.0, 4.8), dpi=80, facecolor="#f0f0f0")
+        self.ax  = self.fig.add_subplot(111)
+        self._setup_axes()
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.window)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
+
+        # Bara de stare
+        bar = tk.Frame(self.window, bg="#e0e0e0", relief=tk.GROOVE, bd=1)
+        bar.pack(fill=tk.X, padx=8, pady=6)
+
+        self.lbl_mqtt = tk.Label(
+            bar, text="● MQTT: connecting…",
+            fg="#e67e00", bg="#e0e0e0", font=("Consolas", 10)
+        )
+        self.lbl_mqtt.pack(side=tk.LEFT, padx=(6, 20))
+
+        self.lbl_value = tk.Label(
+            bar, text="Response: —",
+            fg="#1565c0", bg="#e0e0e0", font=("Consolas", 10)
+        )
+        self.lbl_value.pack(side=tk.LEFT, padx=(0, 20))
+
+        self.lbl_steering = tk.Label(
+            bar, text="Steering: —",
+            fg="#2e7d32", bg="#e0e0e0", font=("Consolas", 10)
+        )
+        self.lbl_steering.pack(side=tk.LEFT)
+
+        self.lbl_frozen = tk.Label(
+            bar, text="", fg="#c62828", bg="#e0e0e0",
+            font=("Consolas", 10, "bold")
+        )
+        self.lbl_frozen.pack(side=tk.RIGHT, padx=10)
+
+        tk.Label(
+            bar,
+            text="Ku = Kp la oscilatie sustinuta  |  Tu = perioada oscilatie (axa X)",
+            fg="#666666", bg="#e0e0e0", font=("Consolas", 9)
+        ).pack(side=tk.RIGHT, padx=20)
+
+        self._schedule_update()
+
+    def _setup_axes(self):
+        ax = self.ax
+        ax.set_facecolor("#ffffff")
+        ax.grid(True, color="#cccccc", linewidth=0.7, alpha=0.9)
+        ax.set_axisbelow(True)
+        for spine in ax.spines.values():
+            spine.set_color("#aaaaaa")
+        ax.set_xlim(0, self.WINDOW_SECONDS)
+        ax.set_ylim(-1.25, 1.25)
+        ax.set_xlabel("Time (s)", color="#333333", fontsize=11)
+        ax.set_ylabel("Normalized Lane Offset", color="#333333", fontsize=11)
+        ax.set_title(
+            "PID Response — Lane Center Tracking  (robot/pid_telemetry @ 20 Hz)",
+            color="#111111", fontsize=12, fontweight="bold", pad=10
+        )
+        ax.tick_params(colors="#444444", labelsize=9)
+        # Linie referință centru
+        ax.axhline(y=0,    color="#555555", linestyle="--", linewidth=1.6, alpha=0.7, label="Reference = 0 (centru bandă)")
+        # Limite ±1
+        ax.axhline(y= 1.0, color="#cc0000", linestyle=":",  linewidth=1.0, alpha=0.5)
+        ax.axhline(y=-1.0, color="#cc0000", linestyle=":",  linewidth=1.0, alpha=0.5)
+        # Zone colorate
+        ax.axhspan(-0.3,  0.3,  alpha=0.08, color="#4caf50")   # zona bună — verde
+        ax.axhspan( 0.3,  1.25, alpha=0.05, color="#ff6600")   # oscilație — portocaliu
+        ax.axhspan(-1.25,-0.3,  alpha=0.05, color="#ff6600")
+        ax.set_yticks([-1.0, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1.0])
+        # Linia de date — albastru ca valorile din Statistics
+        self.line_response, = ax.plot([], [], color="#1565c0", linewidth=2.0, label="Response (offset)")
+        ax.legend(loc="upper right", facecolor="#f5f5f5", edgecolor="#cccccc",
+                  labelcolor="#333333", fontsize=9)
+        self.fig.tight_layout(pad=1.8)
+
+    def _schedule_update(self):
+        if self.alive:
+            self._update_plot()
+            self.window.after(self.UPDATE_MS, self._schedule_update)
+
+    def _update_plot(self):
+        """Dreneaza coada de date si redeseneaza graficul la max 5 Hz."""
+        if self.frozen:
+            return
+
+        # ── 1. Dreneaza TOATA coada (collect la 20 Hz, draw la 5 Hz) ──────────
+        changed = False
+        last_item = None
+        while True:
+            try:
+                item = self.data_queue.get_nowait()
+                last_item = item
+                changed = True
+                ts = item.get("timestamp", 0)
+                if self.start_ts is None:
+                    self.start_ts = ts
+                t = (ts - self.start_ts) / 1000.0
+                self.times.append(t)
+                self.responses.append(item.get("response", 0.0))
+            except queue.Empty:
+                break
+
+        # ── 2. Status bar (intotdeauna, chiar daca nu s-a desenat) ───────────
+        self._update_status_bar(last_item)
+
+        # ── 3. Redraw canvas doar daca avem date noi ─────────────────────────
+        # draw_idle() gestioneaza singur coalescenta — nu e nevoie de flag manual
+        if not changed:
+            return
+
+        try:
+            if self.times:
+                t_now = self.times[-1]
+                t_min = max(0.0, t_now - self.WINDOW_SECONDS)
+                t_max = t_min + self.WINDOW_SECONDS
+                self.ax.set_xlim(t_min, t_max)
+                self.line_response.set_data(list(self.times), list(self.responses))
+            self.canvas.draw_idle()
+        except Exception as e:
+            logger.error(f"[PIDGraph] Eroare la redesenare: {e}")
+
+    def _update_status_bar(self, last_item):
+        connected = self.mqtt_connected_fn()
+        self.lbl_mqtt.config(
+            text="● MQTT: OK" if connected else "● MQTT: OFF",
+            fg="#2e7d32" if connected else "#c62828"
+        )
+        if last_item is not None:
+            resp  = last_item.get("response", 0.0)
+            steer = last_item.get("steering_angle", 0.0)
+            self.lbl_value.config(text=f"Response: {resp:+.3f}")
+            self.lbl_steering.config(text=f"Steering: {steer:+.1f}°")
+        self.lbl_frozen.config(
+            text="⏸ ÎNGHEȚAT — MQTT deconectat" if self.frozen else ""
+        )
+
+    def freeze(self):
+        if not self.frozen:
+            self.frozen = True
+            self.lbl_frozen.config(text="⏸ INGHEȚAT — MQTT deconectat", fg="#f0ad4e")
+            logger.info("[PIDGraph] Frozen — MQTT disconnected")
+
+    def _on_close(self):
+        self.alive = False
+        self.window.destroy()
+
+
 def get_local_ip():
     """Obtine adresa IP locala a laptopului (interfata principala)."""
     try:

@@ -34,7 +34,7 @@ class LaneDetector:
     def __init__(self, 
                  img_width=1920, 
                  img_height=1080,
-                 lane_width_meters=0.6,  # Physical lane width (adjust for your track)
+                 lane_width_meters=0.6,  # Physical lane width 
                  camera_height_meters=0.2):  # Camera height from ground
         """
         Initialize lane detector.
@@ -480,11 +480,14 @@ class LaneDetector:
             annotated: Annotated image with lane overlay
         """
         annotated = frame.copy()
+        scale = self.img_width / 1920.0
         
         if not detection_result['detected']:
-            rx = self.img_width - 560
-            cv2.putText(annotated, "NO LANES DETECTED", (rx, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            rx = self.img_width - int(560 * scale)
+            font_scale = max(0.4, 1.2 * scale)
+            thick = max(1, int(3 * scale))
+            cv2.putText(annotated, "NO LANES DETECTED", (rx, int(50 * scale)),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thick)
             return annotated
         
         # Generate y values
@@ -551,19 +554,22 @@ class LaneDetector:
         # Add text overlay — DREAPTA ecranului
         # camera_track.py ocupă STÂNGA (x=15, y=40/80/120/160)
         # → plasăm textele pe DREAPTA pentru zero suprapuneri
-        rx = self.img_width - 560  # ~1360px pentru 1920px lățime
+        scale = self.img_width / 1920.0
+        rx = self.img_width - int(560 * scale)  # ~1360px pentru 1920px lățime
+        font_scale = max(0.35, 1.0 * scale)
+        thick = max(1, int(2 * scale))
         offset = detection_result['offset']
         offset_m = detection_result['offset_meters']
         
         if offset is not None:
             direction = "LEFT" if offset < 0 else "RIGHT"
             cv2.putText(result, f"Offset: {abs(offset):.0f}px ({abs(offset_m):.3f}m) {direction}",
-                       (rx, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
+                       (rx, int(50 * scale)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 0), thick)
         
-        cv2.putText(result, "LANES DETECTED", (rx, 90),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(result, f"STATE: {self.state.name}", (rx, 130),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
+        cv2.putText(result, "LANES DETECTED", (rx, int(90 * scale)),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thick)
+        cv2.putText(result, f"STATE: {self.state.name}", (rx, int(130 * scale)),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 0, 255), thick)
         
         return result
 

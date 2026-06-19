@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Also add parent for common.signaling
 sys.path.insert(1, str(Path(__file__).parent.parent))
 from common.signaling import SignalingClient
+from config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,6 +137,13 @@ class MQTTHandler:
         self.topic_subscribe_unghi = "robot/control/unghi_manual"
         self.topic_subscribe_viteza = "robot/control/viteza_manual"
 
+        # Clock sync topics (ping/pong)
+        self.topic_ping = "robot/ping"
+        self.topic_pong = "robot/pong"
+
+        # Per-frame video timestamp topic
+        self.topic_video_ts = "robot/video_ts"
+
         # UPS HAT INA219
         self.ina219 = INA219(addr=0x42)
 
@@ -163,7 +171,9 @@ class MQTTHandler:
             client.subscribe(self.topic_subscribe_mod)
             client.subscribe(self.topic_subscribe_unghi)
             client.subscribe(self.topic_subscribe_viteza)
-            logger.info("MQTT: Subscribed to command topics")
+            # Subscribe to clock sync ping topic
+            client.subscribe(self.topic_ping)
+            logger.info("MQTT: Subscribed to command topics + clock sync")
         else:
             logger.error(f"MQTT: Connection failed, code: {rc}")
             self.connected = False
@@ -183,6 +193,17 @@ class MQTTHandler:
 
         try:
             data = json.loads(payload)
+
+            # ── Clock sync: respond to ping immediately ──
+            if topic == self.topic_ping:
+                t_sender = int(time.time() * 1000)
+                pong_payload = json.dumps({
+                    "t_receiver_send": data.get("t_receiver_send", 0),
+                    "t_sender": t_sender
+                })
+                client.publish(self.topic_pong, pong_payload)
+                return
+
 
             if topic == self.topic_subscribe_mod:
                 self.received_commands["mod_de_functionare"] = data.get("mod_de_functionare", 0)
@@ -274,6 +295,32 @@ class MQTTHandler:
             logger.error(f"MQTT: Publish error: {e}")
             return False
 
+    def publish_pid_telemetry(self, response: float, steering_angle: float, timestamp_ms: int):
+        """Publică telemetria PID pe robot/pid_telemetry (pentru graficul din receiver)."""
+        if not self.connected:
+            return False
+        payload = json.dumps({
+            "response":       round(response, 4),
+            "steering_angle": round(steering_angle, 2),
+            "timestamp":      timestamp_ms,
+        })
+        try:
+            self.client.publish("robot/pid_telemetry", payload, qos=0)
+            return True
+        except Exception as e:
+            logger.error(f"MQTT: PID telemetry publish error: {e}")
+            return False
+
+    def publish_video_timestamp(self, timestamp_ms: int):
+        """Publish per-frame video timestamp (lightweight, at full frame rate)."""
+        if not self.connected:
+            return False
+        try:
+            payload = json.dumps({"ts": timestamp_ms})
+            self.client.publish(self.topic_video_ts, payload, qos=0)
+        except Exception:
+            pass
+
     def publish_sistem_data(self):
         """Publish slow system data: CPU, RAM, Temp, Battery (from INA219)."""
         if not self.connected:
@@ -352,7 +399,7 @@ class VideoFileTrackWithMQTT(VideoStreamTrack):
     Displays timestamp and sensor data on each frame.
     """
 
-    def __init__(self, video_path: str, fps: int = 30, mqtt_handler: MQTTHandler = None):
+    def __init__(self, video_path: str, fps: int = CAMERA_FPS, mqtt_handler: MQTTHandler = None):
         super().__init__()
         self.video_path = video_path
         self.target_fps = fps
@@ -365,7 +412,29 @@ class VideoFileTrackWithMQTT(VideoStreamTrack):
         self.simulated_angle = 0.0
         self.simulated_speed = 50.0
 
+        # Timestamp tracking for custom FPS (aiortc hardcodes 30fps)
+        self._custom_start = None
+        self._custom_timestamp = None
+        self._VIDEO_CLOCK_RATE = 90000
+
         self._open_video()
+
+    async def next_timestamp(self):
+        """Override aiortc's next_timestamp() to use self.target_fps."""
+        import asyncio
+        import fractions
+
+        if self._custom_timestamp is not None:
+            ptime = 1 / self.target_fps
+            self._custom_timestamp += int(self._VIDEO_CLOCK_RATE * ptime)
+            wait = self._custom_start + (self._custom_timestamp / self._VIDEO_CLOCK_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            self._custom_start = time.time()
+            self._custom_timestamp = 0
+
+        return self._custom_timestamp, fractions.Fraction(1, self._VIDEO_CLOCK_RATE)
 
     def _open_video(self):
         """Open video file."""
@@ -506,7 +575,7 @@ class VideoFileTrackWithMQTT(VideoStreamTrack):
 
 async def run_sender(video_source: str, server_url: str, fps: int,
                      mqtt_broker: str = None, mqtt_port: int = 1883, use_camera: bool = False,
-                     camera_width: int = 1920, camera_height: int = 1080):
+                     camera_width: int = CAMERA_WIDTH, camera_height: int = CAMERA_HEIGHT):
     """
     Run integrated WebRTC sender with MQTT support.
 
@@ -676,20 +745,20 @@ def main():
     parser.add_argument(
         "--camera-width",
         type=int,
-        default=1920,
-        help="Camera resolution width (default: 1920)"
+        default=CAMERA_WIDTH,
+        help=f"Camera resolution width (default: {CAMERA_WIDTH})"
     )
     parser.add_argument(
         "--camera-height",
         type=int,
-        default=1080,
-        help="Camera resolution height (default: 1080)"
+        default=CAMERA_HEIGHT,
+        help=f"Camera resolution height (default: {CAMERA_HEIGHT})"
     )
     parser.add_argument(
         "--fps",
         type=int,
-        default=30,
-        help="Target FPS for streaming"
+        default=CAMERA_FPS,
+        help=f"Target FPS for streaming (default: {CAMERA_FPS})"
     )
     parser.add_argument(
         "--server-ip",
