@@ -225,7 +225,14 @@ class AutonomousDriver:
                 # Semnal de oprire trimis din cleanup()
                 break
 
-            result = self._process_frame_internal(frame)
+            try:
+                result = self._process_frame_internal(frame)
+            except Exception as e:
+                import traceback
+                logger.error(f"[Worker] Crash in _process_frame_internal: {e}\n{traceback.format_exc()}")
+                print(f"CRITICAL WORKER CRASH: {e}\n{traceback.format_exc()}")
+                # Păstrăm ultimul rezultat ca să nu se blocheze interfața
+                result = self._last_result
 
             # Pune rezultatul în coadă; dacă e plină, înlocuiește rezultatul vechi
             # (preferăm date proaspete față de date vechi)

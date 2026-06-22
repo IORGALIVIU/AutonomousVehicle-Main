@@ -35,24 +35,25 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from av import VideoFrame
 import paho.mqtt.client as mqtt
 
-# Import signaling + sender config (pentru PROCESS_WIDTH/HEIGHT)
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "sender"))
-from common.signaling import SignalingClient
-try:
-    from lane_debug_viz import DebugLaneDetector
-    from config import PROCESS_WIDTH, PROCESS_HEIGHT
-    _LANE_DETECTOR_AVAILABLE = True
-except ImportError as _e:
-    logger.warning(f"DebugLaneDetector not available: {_e}")
-    _LANE_DETECTOR_AVAILABLE = False
-    PROCESS_WIDTH, PROCESS_HEIGHT = 640, 480
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Import signaling
+sys.path.append(str(Path(__file__).parent.parent))
+from common.signaling import SignalingClient
+
+try:
+    from lane_debug_viz import DebugLaneDetector
+    from config import PROCESS_WIDTH, PROCESS_HEIGHT
+    from autonomous_driver import AutonomousDriver
+    _LANE_DETECTOR_AVAILABLE = True
+except ImportError as _e:
+    logger.warning(f"DebugLaneDetector / AutonomousDriver not available: {_e}")
+    _LANE_DETECTOR_AVAILABLE = False
+    PROCESS_WIDTH, PROCESS_HEIGHT = 640, 480
 
 
 # ============================================================================
@@ -413,8 +414,20 @@ class VideoReceiverGUI_MQTT:
         # Setup GUI
         self._setup_ui()
 
-        # Init lane detector (dupa _setup_ui — necesita debug_status_label)
+        # Init local remote autonomous driver (and debug detector)
         self._init_local_lane_detector()
+        
+        self.remote_driver = None
+        if _LANE_DETECTOR_AVAILABLE:
+            # Inițializăm cu rezoluția 1280x720 pentru o scalare optimă a textului pe overlay
+            self.remote_driver = AutonomousDriver(
+                img_width=1280,
+                img_height=720,
+                enable_hardware=False,
+                show_visualization=True,
+                draw_text=True,
+                mqtt_handler=None
+            )
 
         # Start asyncio loop
         self._start_async_loop()
@@ -559,18 +572,20 @@ class VideoReceiverGUI_MQTT:
                         command=self._on_mode_changed).grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Radiobutton(control_panel, text="Manual", variable=self.control_mode, value=1,
                         command=self._on_mode_changed).grid(row=0, column=2, sticky=tk.W, padx=5)
+        ttk.Radiobutton(control_panel, text="Auto Remote", variable=self.control_mode, value=2,
+                        command=self._on_mode_changed).grid(row=0, column=3, sticky=tk.W, padx=5)
 
         # Keyboard control instructions (Manual mode only)
         self.keyboard_label = ttk.Label(control_panel, text="Use Arrow Keys to Control",
                                         foreground="blue", font=("Arial", 9, "bold"))
-        self.keyboard_label.grid(row=1, column=0, columnspan=3, pady=(10, 5))
+        self.keyboard_label.grid(row=1, column=0, columnspan=4, pady=(10, 5))
         # visible by default since we start in manual mode
 
         # Arrow keys help
         self.arrows_help = ttk.Label(control_panel,
                                      text="↑↓ Speed  |  ←→ Angle",
                                      foreground="gray", font=("Arial", 8))
-        self.arrows_help.grid(row=2, column=0, columnspan=3, pady=(0, 10))
+        self.arrows_help.grid(row=2, column=0, columnspan=4, pady=(0, 10))
         # visible by default since we start in manual mode
 
         # Angle display (read-only, no slider)
@@ -723,11 +738,26 @@ class VideoReceiverGUI_MQTT:
             angle, speed = self.gamepad.get_values()
 
             # Update GUI
-            self.control_angle.set(round(angle, 1))
-            self.control_speed.set(round(speed, 1))
+            new_angle = round(angle, 1)
+            new_speed = round(speed, 1)
+            
+            self.control_angle.set(new_angle)
+            self.control_speed.set(new_speed)
 
-            # Auto-send to MQTT (smooth updates)
-            self._send_all_commands()
+            # Auto-send to MQTT (throttle la max 20Hz si do-not-repeat)
+            if not hasattr(self, '_last_manual_send_time'):
+                self._last_manual_send_time = 0
+                self._last_sent_angle = None
+                self._last_sent_speed = None
+                
+            now = time.time()
+            # Trimitem daca a trecut suficient timp (50ms) SI (valorile s-au schimbat)
+            if now - self._last_manual_send_time >= 0.05:
+                if new_angle != self._last_sent_angle or new_speed != self._last_sent_speed:
+                    self._send_all_commands()
+                    self._last_manual_send_time = now
+                    self._last_sent_angle = new_angle
+                    self._last_sent_speed = new_speed
 
         # Schedule next update (~60 FPS)
         self.root.after(16, self._update_from_gamepad)
@@ -799,8 +829,11 @@ class VideoReceiverGUI_MQTT:
             # Show keyboard instructions
             self.keyboard_label.grid()
             self.arrows_help.grid()
+            self.gamepad.reset()
+            self.control_angle.set(0.0)
+            self.control_speed.set(0.0)
             self._log("Manual mode - Use arrow keys to control")
-        else:  # Auto mode
+        elif mode == 2:  # Auto Remote mode
             # Hide keyboard instructions
             self.keyboard_label.grid_remove()
             self.arrows_help.grid_remove()
@@ -808,7 +841,16 @@ class VideoReceiverGUI_MQTT:
             self.gamepad.reset()
             self.control_angle.set(0.0)
             self.control_speed.set(0.0)
-            self._log("Auto mode activated")
+            self._log("Auto Remote mode activated - Processing frames locally")
+        else:  # Auto mode (0)
+            # Hide keyboard instructions
+            self.keyboard_label.grid_remove()
+            self.arrows_help.grid_remove()
+            # Reset gamepad to zero
+            self.gamepad.reset()
+            self.control_angle.set(0.0)
+            self.control_speed.set(0.0)
+            self._log("Auto mode activated - Raspberry Pi is in control")
 
         # Send mode change
         self._send_all_commands()
@@ -835,10 +877,13 @@ class VideoReceiverGUI_MQTT:
         self.mqtt_handler.send_command_angle(angle)
         self.mqtt_handler.send_command_speed(speed)
 
-        mode_text = "Manual" if mode == 1 else "Auto"
+        mode_text = "Manual" if mode == 1 else ("Auto Remote" if mode == 2 else "Auto")
         command_str = f"{mode_text}, {angle:.0f}°, {speed:.0f} RPM"
-        # Dezactivam logarea la fiecare trimitere pentru a evita blocarea GUI (spam la 60 Hz)
-        self.last_command_label.config(text=command_str, foreground="green")
+        
+        # Evitam update-ul de UI (care este lent) daca textul nu s-a schimbat
+        if not hasattr(self, '_last_cmd_str_gui') or self._last_cmd_str_gui != command_str:
+            self.last_command_label.config(text=command_str, foreground="green")
+            self._last_cmd_str_gui = command_str
 
     def _start_async_loop(self):
         """Start asyncio loop in separate thread."""
@@ -1055,6 +1100,56 @@ class VideoReceiverGUI_MQTT:
 
             # Feed frame to local lane detection debug processor
             self._feed_debug_frame(frame)
+            
+            # --- AUTO REMOTE PROCESSING ---
+            if self.control_mode.get() == 2 and self.remote_driver:
+                result = self.remote_driver.process_frame_async(frame)
+                
+                # Preluăm valorile calculate
+                steer = result.get('steering_angle', 0.0)
+                spd = result.get('speed', 0.0)
+                
+                steer_rounded = round(steer, 1)
+                spd_rounded = round(spd, 1)
+                
+                # Actualizăm UI-ul direct
+                self.control_angle.set(steer_rounded)
+                self.control_speed.set(spd_rounded)
+                
+                # Trimitem comenzile către MQTT cu Throttle (la aprox 10Hz) pentru a evita spam-ul si lag-ul
+                if not hasattr(self, '_last_remote_send_time'):
+                    self._last_remote_send_time = 0
+                now = time.time()
+                if now - self._last_remote_send_time >= 0.1:  # max 10 Hz
+                    self._send_all_commands()
+                    self._last_remote_send_time = now
+
+                # Inserăm datele PID în coada locală pentru graficul PID
+                # Verificam ca rezultatul sa fie NOU (evitam duplicate la 30fps)
+                result_time = result.get('processing_time', 0)
+                if not hasattr(self, '_last_pid_result_time') or self._last_pid_result_time != result_time:
+                    self._last_pid_result_time = result_time
+                    offset = result.get('offset')
+                    if offset is not None:
+                        _norm = max(-1.0, min(1.0, offset / (PROCESS_WIDTH / 2.0)))
+                        pid_data = {
+                            "response": _norm,
+                            "steering_angle": steer,
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        try:
+                            self.pid_data_queue.put_nowait(pid_data)
+                        except queue.Full:
+                            try:
+                                self.pid_data_queue.get_nowait()
+                                self.pid_data_queue.put_nowait(pid_data)
+                            except Exception:
+                                pass
+
+                # Folosim frame-ul adnotat (cu linii desenate) pentru vizualizare
+                annotated = result.get('annotated_frame')
+                if annotated is not None:
+                    frame = annotated
 
             # Resize and display
             display_height = 500
@@ -1070,7 +1165,10 @@ class VideoReceiverGUI_MQTT:
             self.video_label.image = img_tk
 
         except Exception as e:
-            logger.error(f"Error updating video: {e}")
+            import traceback
+            err_msg = traceback.format_exc()
+            logger.error(f"Error updating video:\n{err_msg}")
+            print(f"CRITICAL ERROR in _update_video_display: {e}\n{err_msg}")
 
         self.root.after(33, self._update_video_display)
 
@@ -1488,7 +1586,7 @@ class PIDGraphWindow:
     Util pentru Ziegler-Nichols: Ku = Kp la oscilatie sustinuta, Tu = perioada.
     """
     WINDOW_SECONDS = 30
-    UPDATE_MS      = 200   # 5 Hz redraw — reduce CPU
+    UPDATE_MS      = 333   # 3 Hz redraw — reduce masiv încărcarea CPU/GUI
     MAX_POINTS     = WINDOW_SECONDS * 100  # Suportă până la 100 Hz (e.g. 30Hz sau 60Hz FPS) fără pierderi pe stânga graficului
 
     def __init__(self, parent: tk.Tk, data_queue: queue.Queue, mqtt_connected_fn):

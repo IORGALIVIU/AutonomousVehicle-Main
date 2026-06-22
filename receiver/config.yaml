@@ -13,8 +13,8 @@ camera:
 
 pid:
   kp:        1.5    # Gain proporțional — mai mare = reacție mai agresivă
-  ki:        0.012  # Gain integral — corectează drifturi persistente
-  kd:        0.35   # Gain derivativ — amortizează oscilaţiile
+  ki:        0.002  # Gain integral — corectează drifturi persistente
+  kd:        0.03   # Gain derivativ — amortizează oscilaţiile
   max_angle: 50.0   # Unghiul maxim de steering (grade)
   alpha:     0.3    # Smoothing EMA: 0=ultra-neted, 1=fără smoothing
 

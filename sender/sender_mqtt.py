@@ -207,7 +207,12 @@ class MQTTHandler:
 
             if topic == self.topic_subscribe_mod:
                 self.received_commands["mod_de_functionare"] = data.get("mod_de_functionare", 0)
-                mode = "MANUAL" if self.received_commands["mod_de_functionare"] == 1 else "AUTOMAT"
+                if self.received_commands["mod_de_functionare"] == 1:
+                    mode = "MANUAL"
+                elif self.received_commands["mod_de_functionare"] == 2:
+                    mode = "AUTO REMOTE"
+                else:
+                    mode = "AUTOMAT"
                 logger.info(f"[MQTT] Mode received: {mode}")
                 print(f"[MQTT DEBUG] Mode changed to: {mode}")
 
@@ -221,8 +226,8 @@ class MQTTHandler:
                 logger.info(f"[MQTT] Manual angle: {self.received_commands['unghi_manual']}°")
                 print(f"[MQTT DEBUG] Angle command: {self.received_commands['unghi_manual']}°")
 
-                # Apply angle to robot if in MANUAL mode
-                if self.robot_controller and self.received_commands["mod_de_functionare"] == 1:
+                # Apply angle to robot if in MANUAL or AUTO REMOTE mode
+                if self.robot_controller and self.received_commands["mod_de_functionare"] in (1, 2):
                     angle = self.received_commands["unghi_manual"]
                     speed = self.received_commands["viteza_manual"]
                     print("MQTT MESSAGE RECEIVED:", message.topic, message.payload)
@@ -234,8 +239,8 @@ class MQTTHandler:
                 logger.info(f"[MQTT] Manual speed: {self.received_commands['viteza_manual']} RPM")
                 print(f"[MQTT DEBUG] Speed command: {self.received_commands['viteza_manual']} RPM")
 
-                # Apply speed to robot if in MANUAL mode
-                if self.robot_controller and self.received_commands["mod_de_functionare"] == 1:
+                # Apply speed to robot if in MANUAL or AUTO REMOTE mode
+                if self.robot_controller and self.received_commands["mod_de_functionare"] in (1, 2):
                     angle = self.received_commands["unghi_manual"]
                     speed = self.received_commands["viteza_manual"]
                     print("MQTT MESSAGE RECEIVED:", message.topic, message.payload)

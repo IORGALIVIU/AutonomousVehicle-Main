@@ -190,7 +190,7 @@ class PiCameraTrackWithMQTT(VideoStreamTrack):
                     (15, 80), font, 0.8, (0, 255, 255), 2)
         cv2.putText(frame, f"Unghi: {unghi:.2f}deg | Viteza: {viteza:.1f}%",
                     (15, 120), font, 0.8, (0, 255, 255), 2)
-        mode_text = "AUTO" if mode == 0 else "MANUAL"
+        mode_text = "AUTO" if mode == 0 else ("MANUAL" if mode == 1 else "AUTO REMOTE")
         cv2.putText(frame, f"Mode: {mode_text} | Cmd: {unghi:.0f}deg, {viteza:.0f}%",
                     (15, 160), font, 0.8, (255, 0, 255), 2)
         mqtt_status = "Connected" if (self.mqtt_handler and self.mqtt_handler.connected) else "Disconnected"
